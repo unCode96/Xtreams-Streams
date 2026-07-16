@@ -53,67 +53,80 @@ function normalize(str) {
 // ---------------------------------------------------------------------------
 // M3U — descarga, parseo y caché
 // ---------------------------------------------------------------------------
+// M3U — descarga en streaming, almacenamiento como strings compactos
+// ---------------------------------------------------------------------------
+// Formato interno: "xuiId\x00name\x00url"
+// Usamos \x00 (null byte) como separador — nunca aparece en nombres ni URLs
+// Esto evita crear objetos JS por cada item, reduciendo RAM ~5x vs objetos
+// ---------------------------------------------------------------------------
 const M3U_URL = `${XTREAM_SERVER}/get.php?username=${encodeURIComponent(XTREAM_USER)}&password=${encodeURIComponent(XTREAM_PASS)}&type=m3u_plus&output=m3u8`;
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
-// Solo guardamos lo que usamos — descartamos logo, group, etc.
-let m3uCache = { items: [], ts: 0 };
+let m3uCache = { items: [], ts: 0 }; // items = array de strings compactos
 
-function parseM3U(text) {
-    const lines = text.split(/\r?\n/);
-    const items = [];
-    let pending = null;
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line.startsWith('#EXTINF')) {
-            const idMatch   = line.match(/xui-id="([^"]*)"/);
-            const nameMatch = line.match(/tvg-name="([^"]*)"/);
-            const display   = line.split(',').slice(1).join(',').trim();
-            const name      = (nameMatch && nameMatch[1]) || display || '';
-            pending = {
-                xuiId: idMatch ? idMatch[1] : null,
-                name,
-                normalizedName: normalize(name),
-                url: null
-            };
-        } else if (pending && line && !line.startsWith('#')) {
-            if (/^https?:\/\//i.test(line)) {
-                // Descartar canales live — sus URLs terminan en /m3u8
-                if (!line.endsWith('/m3u8')) {
-                    pending.url = line;
-                    if (pending.name && pending.url) items.push(pending);
-                }
-            }
-            pending = null;
-        }
-    }
-    return items;
-}
-
-// Deduplica por xui-id (mismo episodio en múltiples grupos)
-function dedupe(items) {
-    const seen = new Set();
-    const out  = [];
-    for (const it of items) {
-        const key = it.xuiId || it.url;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push(it);
-    }
-    return out;
+function unpack(compact) {
+    const [xuiId, name, url] = compact.split('\x00');
+    return { xuiId, name, url };
 }
 
 async function downloadAndParse() {
     const t0 = Date.now();
-    console.log('[m3u] descargando playlist...');
+    console.log('[m3u] descargando playlist (streaming)...');
+
     const res = await fetch(M3U_URL);
     if (!res.ok) throw new Error(`m3u HTTP ${res.status}`);
-    const text = await res.text();
-    console.log(`[m3u] descarga completada (${((Date.now() - t0) / 1000).toFixed(1)}s), parseando...`);
-    const raw   = parseM3U(text);
-    const items = dedupe(raw);
-    console.log(`[m3u] ${raw.length} entradas → ${items.length} después de dedupe`);
+
+    // Leer el body como stream de texto línea por línea
+    // sin cargar el archivo completo en memoria
+    const items = [];
+    const seen  = new Set(); // dedupe por xuiId
+    let pending = null;
+    let buffer  = '';
+
+    const decoder = new TextDecoder('utf-8');
+
+    for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        // La última línea puede estar incompleta — la guardamos para el próximo chunk
+        buffer = lines.pop();
+
+        for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (line.startsWith('#EXTINF')) {
+                const idMatch   = line.match(/xui-id="([^"]*)"/);
+                const nameMatch = line.match(/tvg-name="([^"]*)"/);
+                const display   = line.split(',').slice(1).join(',').trim();
+                const name      = (nameMatch && nameMatch[1]) || display || '';
+                const xuiId     = idMatch ? idMatch[1] : null;
+                pending = { xuiId, name };
+            } else if (pending && line && !line.startsWith('#')) {
+                if (/^https?:\/\//i.test(line) && !line.endsWith('/m3u8')) {
+                    const key = pending.xuiId || line;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        // Guardar como string compacto en vez de objeto
+                        items.push(`${pending.xuiId || ''}\x00${pending.name}\x00${line}`);
+                    }
+                }
+                pending = null;
+            }
+        }
+    }
+
+    // Procesar cualquier línea restante en el buffer
+    if (buffer.trim() && pending) {
+        const line = buffer.trim();
+        if (/^https?:\/\//i.test(line) && !line.endsWith('/m3u8')) {
+            const key = pending.xuiId || line;
+            if (!seen.has(key)) {
+                items.push(`${pending.xuiId || ''}\x00${pending.name}\x00${line}`);
+            }
+        }
+    }
+
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[m3u] completado en ${elapsed}s — ${items.length} items (live descartados, deduplicados)`);
     return items;
 }
 
@@ -200,33 +213,35 @@ function findInM3U(items, normalizedTitle, season, episode, year) {
     const isSeries = season !== null && episode !== null;
     console.log(`[match] buscando "${normalizedTitle}"${isSeries ? ` S${season}E${episode}` : ''}${year ? ` (${year})` : ''} en ${items.length} items`);
 
-    const candidates = items.filter(it => {
+    const candidates = [];
+    for (const compact of items) {
+        const { name, url } = unpack(compact);
         if (!isSeries) {
-            if (parseEpisode(it.name)) return false;
-            return it.normalizedName.includes(normalizedTitle);
+            if (parseEpisode(name)) continue;
+            if (normalize(name).includes(normalizedTitle)) candidates.push({ name, url });
         } else {
-            const parsed = parseEpisode(it.name);
-            if (!parsed) return false;
-            if (parsed.season !== season || parsed.episode !== episode) return false;
-            return normalize(parsed.title).includes(normalizedTitle) ||
-                   normalizedTitle.includes(normalize(parsed.title));
+            const parsed = parseEpisode(name);
+            if (!parsed) continue;
+            if (parsed.season !== season || parsed.episode !== episode) continue;
+            const normParsed = normalize(parsed.title);
+            if (normParsed.includes(normalizedTitle) || normalizedTitle.includes(normParsed)) {
+                candidates.push({ name, url });
+            }
         }
-    });
+    }
 
     if (!candidates.length) {
         console.warn(`[match] SIN COINCIDENCIA para "${normalizedTitle}"${isSeries ? ` S${season}E${episode}` : ''}`);
         return null;
     }
 
-    // Si hay año disponible, intentar filtrar por él primero
-    // El año en el M3U aparece como "(2026)" al final del nombre
     if (year && candidates.length > 1) {
         const withYear = candidates.filter(it => it.name.includes(`(${year})`));
         if (withYear.length) {
-            console.log(`[match] ${candidates.length} candidatos → filtrado por año ${year} → ${withYear.length} coincidencia(s) → usando: "${withYear[0].name}"`);
+            console.log(`[match] ${candidates.length} candidatos → filtrado por año ${year} → ${withYear.length} → usando: "${withYear[0].name}"`);
             return withYear[0];
         }
-        console.log(`[match] ${candidates.length} candidatos pero ninguno tiene año (${year}) explícito → usando el primero: "${candidates[0].name}"`);
+        console.log(`[match] ${candidates.length} candidatos, ninguno con año (${year}) → usando: "${candidates[0].name}"`);
     } else {
         console.log(`[match] ${candidates.length} coincidencia(s) → usando: "${candidates[0].name}"`);
     }
@@ -242,8 +257,8 @@ const MANIFEST = {
     version: '2.0.0',
     name: 'Streams',
     description: 'Streams desde tu Xtream IPTV via búsqueda Cinemeta/AIOMetadata',
-    logo: 'https://raw.githubusercontent.com/unCode96/Xtreams-Streams/refs/heads/main/logo.png',
-    background: 'https://raw.githubusercontent.com/unCode96/Xtreams-Streams/refs/heads/main/poster.jpg',
+    logo: 'https://i.imgur.com/8bZykpk.png',
+    background: 'https://i.imgur.com/Gr4xMaZ.jpeg',
     resources: ['stream'],
     types: ['movie', 'series'],
     catalogs: [],
