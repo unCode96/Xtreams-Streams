@@ -358,17 +358,23 @@ async function boot() {
     console.log('[boot] iniciando XtreamStreams...');
     console.log(`[boot] servidor Xtream: ${XTREAM_SERVER}`);
 
-    // Descarga y parseo inicial — bloquea hasta terminar
+    // Servidor arranca inmediatamente — AlwaysData mata procesos que tardan en responder
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`[boot] servidor escuchando en puerto ${PORT}`);
+        console.log(`[boot] manifest: http://localhost:${PORT}/manifest.json`);
+    });
+
+    // M3U se carga en background — requests durante la carga devuelven streams: []
+    console.log('[boot] cargando M3U en background...');
     try {
         const items = await downloadAndParse();
         m3uCache = { items, ts: Date.now() };
-        console.log(`[boot] M3U listo — ${items.length} items cargados`);
+        console.log(`[boot] M3U listo — ${items.length} items cargados, addon operativo`);
     } catch (e) {
         console.error(`[boot] ERROR al cargar M3U: ${e.message}`);
-        process.exit(1);
     }
 
-    // Refresco periódico en background cada 6h
+    // Refresco periódico cada 6h
     setInterval(async () => {
         console.log('[m3u] refrescando caché en background...');
         try {
@@ -379,13 +385,6 @@ async function boot() {
             console.error(`[m3u] error al refrescar: ${e.message}`);
         }
     }, CACHE_TTL_MS);
-
-    // Recién aquí el servidor empieza a escuchar
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`[boot] servidor escuchando en puerto ${PORT}`);
-        console.log(`[boot] manifest: http://localhost:${PORT}/manifest.json`);
-        console.log(`[boot] todo listo — esperando requests`);
-    });
 }
 
 boot();
